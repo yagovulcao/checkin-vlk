@@ -212,10 +212,33 @@ if admin_gate() and is_admin():
         if not rows:
             st.info("Sem registros para os filtros atuais.")
         else:
+            # ====== LISTAGEM FORMATADA (NOME, FUNÇÃO, DATA/PT-BR, HORA) ======
             for r in rows:
-                user_name = (r.get("users") or {}).get("name") or "—"
-                user_role = (r.get("users") or {}).get("role") or "—"
-                st.write(f"**{user_name}** ({user_role}) — {r['created_at']}")
+                user_data = r.get("users") or {}
+                user_name = user_data.get("name") or "—"
+                user_role = user_data.get("role") or "—"
+
+                # created_at pode vir em UTC com 'Z'; converte para America/Belem
+                try:
+                    dt_utc = datetime.fromisoformat(r["created_at"].replace("Z", "+00:00"))
+                    dt_local = dt_utc.astimezone(TIMEZONE)
+                except Exception:
+                    dt_local = agora()
+
+                data_fmt = dt_local.strftime("%d/%m/%Y")
+                hora_fmt = dt_local.strftime("%H:%M")
+
+                # monta cartão textual
+                st.markdown(
+                    f"""
+                    <div style="padding:12px; border-radius:10px; border:1px solid #e2e2e2; margin-bottom:10px; background:#fafafa;">
+                        <div style="font-weight:600; font-size:16px;">{user_name}</div>
+                        <div style="color:#555; margin-top:2px;"><em>{user_role}</em></div>
+                        <div style="margin-top:6px;">📅 {data_fmt} &nbsp;&nbsp; ⏰ {hora_fmt}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
 
                 # get_public_url pode variar por versão
                 public_resp = supabase.storage.from_(BUCKET).get_public_url(r["photo_path"])
@@ -229,7 +252,7 @@ if admin_gate() and is_admin():
                     public_url = None
 
                 if public_url:
-                    show_image(public_url)
+                    show_image(public_url, caption=None)
                 else:
                     st.write(f"Foto: {r['photo_path']}")
 
