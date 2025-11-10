@@ -67,10 +67,18 @@ inject_css()
 # HELPERS
 # =========================
 def show_image(img, caption=None):
+    """Exibe imagem adaptando para versões diferentes do Streamlit."""
     try:
+        # versões novas do Streamlit
         st.image(img, caption=caption, use_container_width=True)
     except TypeError:
-        st.image(img, caption=caption)
+        try:
+            # versões antigas
+            st.image(img, caption=caption, use_column_width=True)
+        except Exception:
+            # fallback
+            st.image(img, caption=caption)
+
 
 def agora():
     return datetime.now(TIMEZONE)
