@@ -24,6 +24,8 @@ def get_secret(key: str, default: str | None = None):
 SUPABASE_URL = get_secret("SUPABASE_URL")
 SUPABASE_ANON_KEY = get_secret("SUPABASE_ANON_KEY")
 ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD", "")
+# Opcional e recomendado para exclusão no Admin:
+SUPABASE_SERVICE_KEY = get_secret("SUPABASE_SERVICE_KEY", "")
 
 if not SUPABASE_URL or not SUPABASE_ANON_KEY:
     st.error("Config ausente: defina SUPABASE_URL e SUPABASE_ANON_KEY nos Secrets/variáveis.")
@@ -32,7 +34,16 @@ if not SUPABASE_URL or not SUPABASE_ANON_KEY:
 BUCKET = "photos"
 TIMEZONE = ZoneInfo("America/Belem")
 UTC = ZoneInfo("UTC")
+
+# Cliente padrão (anon) para operações normais
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+# Cliente admin (service role) somente para exclusões, se disponível
+supabase_admin: Client | None = None
+if SUPABASE_SERVICE_KEY:
+    try:
+        supabase_admin = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    except Exception:
+        supabase_admin = None
 
 # =========================
 # ESTILO (visual polish)
@@ -41,7 +52,6 @@ def inject_css():
     st.markdown(
         """
         <style>
-        /* cards suaves */
         .vlk-card {
             padding: 12px; border-radius: 12px;
             border: 1px solid #e8e8ef; background: #fafafa;
@@ -49,19 +59,15 @@ def inject_css():
         }
         .vlk-title { font-weight: 700; font-size: 18px; }
         .vlk-subtle { color: #6a6a75; }
-        .vlk-divider { height:1px; background:#ececf2; margin: 12px 0; }
-        /* inputs mais amigáveis */
         .stTextInput > div > div > input,
         .stTextArea textarea, .stSelectbox, .stDateInput input {
             border-radius: 10px !important;
         }
-        /* miniaturas mais agradáveis */
         .thumb { border-radius: 10px; border:1px solid #ececf2; }
         </style>
         """,
         unsafe_allow_html=True
     )
-
 inject_css()
 
 # =========================
@@ -81,7 +87,6 @@ def agora():
     return datetime.now(TIMEZONE)
 
 def resize_max(image: Image.Image, max_side: int = 1024) -> Image.Image:
-    """Redimensiona mantendo proporção para que o maior lado seja no máx. max_side."""
     w, h = image.size
     m = max(w, h)
     if m <= max_side:
@@ -91,7 +96,6 @@ def resize_max(image: Image.Image, max_side: int = 1024) -> Image.Image:
     return image.resize(new_size, Image.LANCZOS)
 
 def upload_photo(image: Image.Image, storage_path: str) -> str:
-    """Redimensiona, salva JPEG otimizado e envia para o bucket."""
     if image.mode not in ("RGB", "L"):
         image = image.convert("RGB")
     image = resize_max(image, 1024)
@@ -116,7 +120,6 @@ def ensure_bucket():
     except Exception:
         st.error(f"Bucket '{BUCKET}' não encontrado no Supabase.")
         st.stop()
-
 ensure_bucket()
 
 # -------------------------
@@ -143,8 +146,10 @@ def registrar_checkin(user_id: str, photo_path: str):
     supabase.table("checkins").insert({"user_id": user_id, "photo_path": photo_path}).execute()
 
 def buscar_checkins(limit=2000, dt_from: date | None = None, dt_to: date | None = None, nome_like: str | None = None):
-    """Busca muitos e permite agrupar na UI."""
-    q = supabase.table("checkins").select("id, created_at, photo_path, user_id, users(name, role)").order("created_at", desc=True)
+    """Traz também users.id para agrupar corretamente e permitir exclusão."""
+    q = supabase.table("checkins").select(
+        "id, created_at, photo_path, user_id, users(id, name, role)"
+    ).order("created_at", desc=True)
     if dt_from:
         q = q.gte("created_at", f"{dt_from} 00:00:00+00")
     if dt_to:
@@ -157,22 +162,17 @@ def buscar_checkins(limit=2000, dt_from: date | None = None, dt_to: date | None 
         rows = [r for r in rows if termo in ((r.get("users") or {}).get("name") or "").lower()]
     return rows
 
-# Utilitário: checar duplicidade diária
-def ja_tem_checkin_hoje(user_id: str) -> bool:
-    """Retorna True se já houver check-in do user no dia local (America/Belem)."""
-    now_local = agora().replace(hour=0, minute=0, second=0, microsecond=0)
-    start_local = now_local
-    end_local = start_local + timedelta(days=1)
-
+def tem_checkin_recente(user_id: str, minutos: int = 30) -> bool:
+    now_local = agora()
+    start_local = now_local - timedelta(minutes=minutos)
     start_utc = start_local.astimezone(UTC).isoformat()
-    end_utc = end_local.astimezone(UTC).isoformat()
-
+    now_utc = now_local.astimezone(UTC).isoformat()
     res = (
         supabase.table("checkins")
         .select("id")
         .eq("user_id", user_id)
         .gte("created_at", start_utc)
-        .lt("created_at", end_utc)
+        .lt("created_at", now_utc)
         .limit(1)
         .execute()
     )
@@ -182,96 +182,67 @@ def ja_tem_checkin_hoje(user_id: str) -> bool:
 # AGRUPAMENTO / “PASTAS”
 # -------------------------
 def agrupar_por_usuario_dia(rows):
-    """
-    Retorna:
-    {
-      user_id: {
-        'name': 'Maria',
-        'role': 'Produção',
-        'dias': {
-           '2025-11-07': [ {photo_path, created_at}, ... ],
-           ...
-        }
-      },
-      ...
-    }
-    """
+    """Agrupa por usuário (id confiável) e por dia local; inclui checkin_id para exclusão."""
     grouped = defaultdict(lambda: {"name": "", "role": "", "dias": defaultdict(list)})
     for r in rows:
         u = r.get("users") or {}
-        uid = r.get("user_id")
+        uid = r.get("user_id") or u.get("id")
+        if not uid:
+            continue
         nome = u.get("name") or "—"
         role = u.get("role") or "—"
         created = r["created_at"]
-        # normaliza dia
         try:
             dt_utc = datetime.fromisoformat(created.replace("Z", "+00:00"))
             dt_local = dt_utc.astimezone(TIMEZONE)
         except Exception:
             dt_local = agora()
         dia = dt_local.strftime("%Y-%m-%d")
-
         grouped[uid]["name"] = nome
         grouped[uid]["role"] = role
         grouped[uid]["dias"][dia].append(
-            {"photo_path": r["photo_path"], "created_at": dt_local}
+            {"photo_path": r["photo_path"], "created_at": dt_local, "checkin_id": r["id"]}
         )
     return grouped
 
 # -------------------------
-# NORMALIZAÇÃO DE STORAGE
+# NORMALIZAÇÃO DE STORAGE (opcional, mantida)
 # -------------------------
 def desired_path(user_id: str, created_at: datetime) -> str:
     return f"{user_id}/{created_at.strftime('%Y-%m-%d')}/{created_at.strftime('%H%M%S%f')}.jpg"
 
 def normalize_storage_paths(rows):
-    """
-    Move (ou copia+remove) objetos antigos para a estrutura:
-    user_id/AAAA-MM-DD/HHMMSSfff.jpg
-    e atualiza 'photo_path' no banco.
-    """
     moved = 0
     for r in rows:
-        uid = r.get("user_id")
+        u = r.get("users") or {}
+        uid = r.get("user_id") or u.get("id")
         if not uid:
             continue
-
-        # created_at -> timezone já convertido em buscar/agrupamento
-        created = r["created_at"]
         try:
-            dt = datetime.fromisoformat(created.replace("Z", "+00:00")).astimezone(TIMEZONE)
+            dt = datetime.fromisoformat(r["created_at"].replace("Z", "+00:00")).astimezone(TIMEZONE)
         except Exception:
             dt = agora()
-
         current_path = r["photo_path"]
         new_path = desired_path(uid, dt)
-
         if current_path == new_path:
             continue
-
         storage = supabase.storage.from_(BUCKET)
-
-        # tenta mover diretamente
         try:
             if hasattr(storage, "move"):
                 storage.move(current_path, new_path)  # type: ignore
             else:
                 raise AttributeError("move not available")
         except Exception:
-            # fallback: copy + remove
             try:
                 storage.copy(current_path, new_path)
                 storage.remove(current_path)
             except Exception:
                 continue
-
-        # atualiza no banco
         try:
             supabase.table("checkins").update({"photo_path": new_path}).eq("id", r["id"]).execute()
             moved += 1
         except Exception:
             pass
-
     return moved
 
 # =========================
@@ -315,14 +286,12 @@ tab_cadastro, tab_registro = st.tabs(["✍️ Cadastro", "✅ Registro"])
 # -------- CADASTRO --------
 with tab_cadastro:
     st.subheader("Cadastrar novo colaborador")
-
     with st.form("cadastro_form", clear_on_submit=True):
         name = st.text_input("Nome completo*", placeholder="Ex.: Maria Silva")
         role = st.text_input("Função", placeholder="Ex.: Produção")
         phone = st.text_input("Telefone", placeholder="(xx) xxxxx-xxxx")
         email = st.text_input("Email (opcional)", placeholder="email@empresa.com")
         submitted = st.form_submit_button("Salvar cadastro")
-
     if submitted:
         if not name.strip():
             st.error("O nome é obrigatório.")
@@ -340,23 +309,17 @@ with tab_cadastro:
 with tab_registro:
     st.subheader("Registro de presença com foto")
     usuarios = listar_usuarios()
-
     if not usuarios:
         st.info("Nenhum usuário cadastrado. Vá para a aba *Cadastro*.")
     else:
-        # ------- BUSCA (acento-insensível) -------
         def norm(s: str) -> str:
             s = unicodedata.normalize("NFKD", s or "")
             return "".join(c for c in s if not unicodedata.combining(c)).lower().strip()
-
         busca = st.text_input("Digite seu nome ou parte dele:", placeholder="Ex.: Maria / Joao / Ana...")
-
         filtrados = [u for u in usuarios if not busca or norm(busca) in norm(u["name"])]
-
         if not filtrados:
             st.info("Nenhum nome encontrado. Tente outra grafia.")
             st.stop()
-
         if len(filtrados) == 1:
             user = filtrados[0]
             st.success(f"Selecionado: {user['name']}")
@@ -376,13 +339,12 @@ with tab_registro:
             img = Image.open(foto)
             show_image(img, caption="Pré-visualização")
 
-            # BLOQUEIO: 1 check-in por dia
-            if ja_tem_checkin_hoje(user["id"]):
-                st.error("Você já fez o check-in hoje. O registro é permitido apenas 1 vez por dia.")
+            # Janela de 30min
+            if tem_checkin_recente(user["id"], minutos=30):
+                st.error("Você já registrou há menos de 30 minutos. Tente novamente mais tarde.")
             else:
                 if st.button("✅ Confirmar e enviar"):
                     ts = agora()
-                    # SALVA JÁ NA ESTRUTURA "PASTAS": user_id/AAAA-MM-DD/HHMMSSfff.jpg
                     storage_path = f"{user['id']}/{ts.strftime('%Y-%m-%d')}/{ts.strftime('%H%M%S%f')}.jpg"
                     try:
                         upload_photo(img, storage_path)
@@ -392,7 +354,7 @@ with tab_registro:
                         st.error(f"❌ Falha ao registrar: {e}")
 
 # =========================
-# UI — ADMIN (oculto + “pastas”)
+# UI — ADMIN (oculto + “galeria com exclusão manual”)
 # =========================
 if admin_gate() and is_admin():
     st.markdown("---")
@@ -406,13 +368,13 @@ if admin_gate() and is_admin():
     with coln:
         nome_like = st.text_input("Buscar por nome", placeholder="ex.: Maria")
 
-    st.caption("Dica: este modo exibe registros agrupados por **Usuário → Dia** com miniaturas.")
+    st.caption("Modo pastas (Usuário → Dia) com miniaturas. Marque as fotos que deseja EXCLUIR e confirme abaixo.")
     limit = st.slider("Quantidade máxima a carregar", min_value=200, max_value=5000, value=2000, step=100)
 
     try:
         rows = buscar_checkins(limit=limit, dt_from=dt_from, dt_to=dt_to, nome_like=nome_like or None)
 
-        # BOTÃO: NORMALIZAR ARQUIVOS ANTIGOS PARA A ESTRUTURA DE PASTAS
+        # Organização opcional
         with st.expander("🧹 Organizar storage (mover fotos antigas para /user_id/AAAA-MM-DD/HHMMSS.jpg)"):
             st.write("Use quando houver registros antigos fora da estrutura. Atualiza paths no banco.")
             if st.button("Executar organização agora"):
@@ -424,52 +386,89 @@ if admin_gate() and is_admin():
         else:
             grouped = agrupar_por_usuario_dia(rows)
 
-            # LISTA DE USUÁRIOS (pastas)
+            # Coletores de seleção
+            if "to_delete" not in st.session_state:
+                st.session_state.to_delete = set()
+
+            # Render “pastas”
             for uid, meta in grouped.items():
                 with st.expander(f"👤 {meta['name']} — {meta['role']}", expanded=False):
-                    # por dia (mais recente primeiro)
                     for dia in sorted(meta["dias"].keys(), reverse=True):
                         reg_dia = meta["dias"][dia]
-                        # título bonito do dia
                         try:
                             data_br = datetime.strptime(dia, "%Y-%m-%d").strftime("%d/%m/%Y")
                         except Exception:
                             data_br = dia
                         st.markdown(f"<div class='vlk-card'><div class='vlk-title'>📅 {data_br}</div></div>", unsafe_allow_html=True)
 
-                        # grade de miniaturas (3 colunas)
                         cols = st.columns(3)
                         cidx = 0
                         for item in reg_dia:
                             created = item["created_at"]
                             hora = created.strftime("%H:%M")
-                            public_resp = supabase.storage.from_(BUCKET).get_public_url(item["photo_path"])
+                            checkin_id = item["checkin_id"]
+                            path = item["photo_path"]
+                            public_resp = supabase.storage.from_(BUCKET).get_public_url(path)
                             public_url = (
-                                public_resp
-                                if isinstance(public_resp, str)
-                                else public_resp.public_url
-                                if hasattr(public_resp, "public_url")
-                                else public_resp.get("publicUrl")
-                                if isinstance(public_resp, dict)
+                                public_resp if isinstance(public_resp, str)
+                                else public_resp.public_url if hasattr(public_resp, "public_url")
+                                else public_resp.get("publicUrl") if isinstance(public_resp, dict)
                                 else None
                             )
                             with cols[cidx]:
                                 if public_url:
                                     show_image(public_url, caption=hora)
                                 else:
-                                    st.write(item["photo_path"])
+                                    st.write(path)
+                                # checkbox para seleção de exclusão
+                                key_cb = f"del_{checkin_id}"
+                                checked = st.checkbox("Excluir", key=key_cb)
+                                if checked:
+                                    st.session_state.to_delete.add((checkin_id, path))
+                                else:
+                                    # desmarca se já estava marcado
+                                    st.session_state.to_delete.discard((checkin_id, path))
                             cidx = (cidx + 1) % 3
 
-        # EXPORTAÇÃO CSV
+            st.divider()
+            st.write(f"Selecionadas para exclusão: **{len(st.session_state.to_delete)}** foto(s).")
+
+            # Segurança: precisa service key?
+            if not supabase_admin:
+                st.warning("Para excluir com segurança, configure `SUPABASE_SERVICE_KEY` nos Secrets. Tentarei com a anon key, mas suas RLS/Policies devem permitir DELETE e remoção no Storage.")
+
+            # Confirmação dupla
+            col_a, col_b = st.columns([1, 2])
+            with col_a:
+                ready = st.checkbox("Confirmo que revisei as seleções")
+            with col_b:
+                if st.button("🗑️ Excluir selecionadas", type="primary", disabled=not ready or len(st.session_state.to_delete) == 0):
+                    ids = [cid for (cid, _) in st.session_state.to_delete]
+                    paths = [p for (_, p) in st.session_state.to_delete]
+                    try:
+                        client_del = supabase_admin or supabase
+                        # 1) Deletar do banco
+                        if ids:
+                            client_del.table("checkins").delete().in_("id", ids).execute()
+                        # 2) Remover do storage
+                        if paths:
+                            client_del.storage.from_(BUCKET).remove(paths)
+                        st.session_state.to_delete.clear()
+                        st.success("Exclusão concluída. Atualize os filtros para recarregar.")
+                    except Exception as e:
+                        st.error(f"Falha ao excluir: {e}")
+
+        # Exportação CSV
         import pandas as pd
         df = pd.DataFrame(
             [
                 {
                     "created_at": r["created_at"],
-                    "user_id": r.get("user_id"),
+                    "user_id": r.get("user_id") or (r.get("users") or {}).get("id"),
                     "name": (r.get("users") or {}).get("name"),
                     "role": (r.get("users") or {}).get("role"),
                     "photo_path": r["photo_path"],
+                    "checkin_id": r["id"],
                 }
                 for r in rows
             ]
@@ -483,12 +482,3 @@ if admin_gate() and is_admin():
 
     except Exception as e:
         st.error(f"Erro ao carregar Admin: {e}")
-
-# =========================
-# IDEIAS DE MELHORIA (TODO)
-# =========================
-# 1) Assinatura de URL (privacidade): usar create_signed_url(path, expires_in=60) no Admin em vez de bucket público.
-# 2) Paginação/lazy load no Admin para períodos muito grandes.
-# 3) QR Code/UID por usuário para pular a busca de nome no registro (ideal para filas grandes).
-# 4) Exportação ZIP das fotos de um dia/usuário (download por pasta).
-# 5) Campo "site/turno" no cadastro, e filtros por local/turno no Admin.
