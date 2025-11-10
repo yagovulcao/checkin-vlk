@@ -336,22 +336,28 @@ with tab_registro:
 
         foto = st.camera_input("📸 Tire uma foto (use a câmera frontal do celular)")
         if foto:
-            img = Image.open(foto)
-            show_image(img, caption="Pré-visualização")
+    img = Image.open(foto)
+    show_image(img, caption="Pré-visualização")
 
-            # Janela de 30min
-            if tem_checkin_recente(user["id"], minutos=30):
-                st.error("Você já registrou há menos de 30 minutos. Tente novamente mais tarde.")
-            else:
-                if st.button("✅ Confirmar e enviar"):
-                    ts = agora()
-                    storage_path = f"{user['id']}/{ts.strftime('%Y-%m-%d')}/{ts.strftime('%H%M%S%f')}.jpg"
-                    try:
-                        upload_photo(img, storage_path)
-                        registrar_checkin(user["id"], storage_path)
-                        st.success("✅ Presença registrada com sucesso!")
-                    except Exception as e:
-                        st.error(f"❌ Falha ao registrar: {e}")
+    # monta rótulo com confirmação visual: nome + finais do telefone (se houver)
+    phone = (user.get("phone") or "").strip()
+    finais = phone[-4:] if len(phone) >= 4 else "----"
+    botao_confirma = f"✅ Confirmar: Sou {user['name']} (***{finais})"
+
+    # Janela de 30min
+    if tem_checkin_recente(user["id"], minutos=30):
+        st.error("Você já registrou há menos de 30 minutos. Tente novamente mais tarde.")
+    else:
+        if st.button(botao_confirma):
+            ts = agora()
+            storage_path = f"{user['id']}/{ts.strftime('%Y-%m-%d')}/{ts.strftime('%H%M%S%f')}.jpg"
+            try:
+                upload_photo(img, storage_path)
+                registrar_checkin(user["id"], storage_path)
+                st.success("✅ Presença registrada com sucesso!")
+            except Exception as e:
+                st.error(f"❌ Falha ao registrar: {e}")
+
 
 # =========================
 # UI — ADMIN (oculto + “galeria com exclusão manual”)
@@ -478,7 +484,9 @@ if admin_gate() and is_admin():
             data=df.to_csv(index=False).encode("utf-8"),
             file_name="checkins.csv",
             mime="text/csv",
-        )
+if foto:
+    img = Image.open(foto)
+    show_image(img, caption="Pré-visualização")
 
     except Exception as e:
         st.error(f"Erro ao carregar Admin: {e}")
