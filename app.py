@@ -1,7 +1,7 @@
 import os
 import unicodedata
 from io import BytesIO
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 from collections import defaultdict
 
@@ -31,6 +31,7 @@ if not SUPABASE_URL or not SUPABASE_ANON_KEY:
 
 BUCKET = "photos"
 TIMEZONE = ZoneInfo("America/Belem")
+UTC = ZoneInfo("UTC")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
 # =========================
@@ -69,27 +70,33 @@ inject_css()
 def show_image(img, caption=None):
     """Exibe imagem adaptando para versões diferentes do Streamlit."""
     try:
-        # versões novas do Streamlit
         st.image(img, caption=caption, use_container_width=True)
     except TypeError:
         try:
-            # versões antigas
             st.image(img, caption=caption, use_column_width=True)
         except Exception:
-            # fallback
             st.image(img, caption=caption)
-
 
 def agora():
     return datetime.now(TIMEZONE)
 
+def resize_max(image: Image.Image, max_side: int = 1024) -> Image.Image:
+    """Redimensiona mantendo proporção para que o maior lado seja no máx. max_side."""
+    w, h = image.size
+    m = max(w, h)
+    if m <= max_side:
+        return image
+    scale = max_side / float(m)
+    new_size = (int(w * scale), int(h * scale))
+    return image.resize(new_size, Image.LANCZOS)
+
 def upload_photo(image: Image.Image, storage_path: str) -> str:
-    """Salva JPEG otimizado e envia para o bucket."""
+    """Redimensiona, salva JPEG otimizado e envia para o bucket."""
     if image.mode not in ("RGB", "L"):
         image = image.convert("RGB")
+    image = resize_max(image, 1024)
 
     bio = BytesIO()
-    # qualidade 85 reduz tamanho sem perder legibilidade
     image.save(bio, format="JPEG", quality=85, optimize=True)
     data = bio.getvalue()
 
@@ -149,6 +156,27 @@ def buscar_checkins(limit=2000, dt_from: date | None = None, dt_to: date | None 
         termo = nome_like.lower()
         rows = [r for r in rows if termo in ((r.get("users") or {}).get("name") or "").lower()]
     return rows
+
+# Utilitário: checar duplicidade diária
+def ja_tem_checkin_hoje(user_id: str) -> bool:
+    """Retorna True se já houver check-in do user no dia local (America/Belem)."""
+    now_local = agora().replace(hour=0, minute=0, second=0, microsecond=0)
+    start_local = now_local
+    end_local = start_local + timedelta(days=1)
+
+    start_utc = start_local.astimezone(UTC).isoformat()
+    end_utc = end_local.astimezone(UTC).isoformat()
+
+    res = (
+        supabase.table("checkins")
+        .select("id")
+        .eq("user_id", user_id)
+        .gte("created_at", start_utc)
+        .lt("created_at", end_utc)
+        .limit(1)
+        .execute()
+    )
+    return bool(res.data)
 
 # -------------------------
 # AGRUPAMENTO / “PASTAS”
@@ -225,7 +253,6 @@ def normalize_storage_paths(rows):
 
         # tenta mover diretamente
         try:
-            # nem toda SDK expõe move; se não existir, cairá no except
             if hasattr(storage, "move"):
                 storage.move(current_path, new_path)  # type: ignore
             else:
@@ -236,7 +263,6 @@ def normalize_storage_paths(rows):
                 storage.copy(current_path, new_path)
                 storage.remove(current_path)
             except Exception:
-                # se não conseguir copiar/remover, segue para o próximo
                 continue
 
         # atualiza no banco
@@ -244,7 +270,6 @@ def normalize_storage_paths(rows):
             supabase.table("checkins").update({"photo_path": new_path}).eq("id", r["id"]).execute()
             moved += 1
         except Exception:
-            # se não atualizar, não quebra o loop
             pass
 
     return moved
@@ -351,16 +376,20 @@ with tab_registro:
             img = Image.open(foto)
             show_image(img, caption="Pré-visualização")
 
-            if st.button("✅ Confirmar e enviar"):
-                ts = agora()
-                # SALVA JÁ NA ESTRUTURA "PASTAS": user_id/AAAA-MM-DD/HHMMSSfff.jpg
-                storage_path = f"{user['id']}/{ts.strftime('%Y-%m-%d')}/{ts.strftime('%H%M%S%f')}.jpg"
-                try:
-                    upload_photo(img, storage_path)
-                    registrar_checkin(user["id"], storage_path)
-                    st.success("✅ Presença registrada com sucesso!")
-                except Exception as e:
-                    st.error(f"❌ Falha ao registrar: {e}")
+            # BLOQUEIO: 1 check-in por dia
+            if ja_tem_checkin_hoje(user["id"]):
+                st.error("Você já fez o check-in hoje. O registro é permitido apenas 1 vez por dia.")
+            else:
+                if st.button("✅ Confirmar e enviar"):
+                    ts = agora()
+                    # SALVA JÁ NA ESTRUTURA "PASTAS": user_id/AAAA-MM-DD/HHMMSSfff.jpg
+                    storage_path = f"{user['id']}/{ts.strftime('%Y-%m-%d')}/{ts.strftime('%H%M%S%f')}.jpg"
+                    try:
+                        upload_photo(img, storage_path)
+                        registrar_checkin(user["id"], storage_path)
+                        st.success("✅ Presença registrada com sucesso!")
+                    except Exception as e:
+                        st.error(f"❌ Falha ao registrar: {e}")
 
 # =========================
 # UI — ADMIN (oculto + “pastas”)
@@ -398,8 +427,7 @@ if admin_gate() and is_admin():
             # LISTA DE USUÁRIOS (pastas)
             for uid, meta in grouped.items():
                 with st.expander(f"👤 {meta['name']} — {meta['role']}", expanded=False):
-                    # por dia
-                    # ordena dias do mais recente para o mais antigo
+                    # por dia (mais recente primeiro)
                     for dia in sorted(meta["dias"].keys(), reverse=True):
                         reg_dia = meta["dias"][dia]
                         # título bonito do dia
@@ -415,7 +443,6 @@ if admin_gate() and is_admin():
                         for item in reg_dia:
                             created = item["created_at"]
                             hora = created.strftime("%H:%M")
-                            # torna público (ou use URL assinada no futuro)
                             public_resp = supabase.storage.from_(BUCKET).get_public_url(item["photo_path"])
                             public_url = (
                                 public_resp
@@ -428,7 +455,7 @@ if admin_gate() and is_admin():
                             )
                             with cols[cidx]:
                                 if public_url:
-                                    st.image(public_url, caption=hora, use_container_width=True)
+                                    show_image(public_url, caption=hora)
                                 else:
                                     st.write(item["photo_path"])
                             cidx = (cidx + 1) % 3
@@ -460,8 +487,8 @@ if admin_gate() and is_admin():
 # =========================
 # IDEIAS DE MELHORIA (TODO)
 # =========================
-# 1) Compressão extra: redimensionar a imagem para máx. 1024px no maior lado antes do upload (menos storage).
-# 2) Evitar duplicidade diária: antes de gravar, consultar se já existe check-in do user no dia e bloquear/alertar.
-# 3) Assinatura de URL (privacidade): usar create_signed_url(path, expires_in=60) no Admin em vez de bucket público.
-# 4) Paginação/lazy load no Admin para períodos muito grandes.
-# 5) QR Code/UID por usuário para pular a busca de nome no registro (ideal para filas grandes).
+# 1) Assinatura de URL (privacidade): usar create_signed_url(path, expires_in=60) no Admin em vez de bucket público.
+# 2) Paginação/lazy load no Admin para períodos muito grandes.
+# 3) QR Code/UID por usuário para pular a busca de nome no registro (ideal para filas grandes).
+# 4) Exportação ZIP das fotos de um dia/usuário (download por pasta).
+# 5) Campo "site/turno" no cadastro, e filtros por local/turno no Admin.
