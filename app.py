@@ -3,6 +3,7 @@ import unicodedata
 from io import BytesIO
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
+from collections import defaultdict
 
 import streamlit as st
 from PIL import Image
@@ -32,6 +33,35 @@ BUCKET = "photos"
 TIMEZONE = ZoneInfo("America/Belem")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
+# =========================
+# ESTILO (visual polish)
+# =========================
+def inject_css():
+    st.markdown(
+        """
+        <style>
+        /* cards suaves */
+        .vlk-card {
+            padding: 12px; border-radius: 12px;
+            border: 1px solid #e8e8ef; background: #fafafa;
+            margin: 8px 0;
+        }
+        .vlk-title { font-weight: 700; font-size: 18px; }
+        .vlk-subtle { color: #6a6a75; }
+        .vlk-divider { height:1px; background:#ececf2; margin: 12px 0; }
+        /* inputs mais amigáveis */
+        .stTextInput > div > div > input,
+        .stTextArea textarea, .stSelectbox, .stDateInput input {
+            border-radius: 10px !important;
+        }
+        /* miniaturas mais agradáveis */
+        .thumb { border-radius: 10px; border:1px solid #ececf2; }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
+inject_css()
 
 # =========================
 # HELPERS
@@ -42,17 +72,17 @@ def show_image(img, caption=None):
     except TypeError:
         st.image(img, caption=caption)
 
-
 def agora():
     return datetime.now(TIMEZONE)
 
-
 def upload_photo(image: Image.Image, storage_path: str) -> str:
+    """Salva JPEG otimizado e envia para o bucket."""
     if image.mode not in ("RGB", "L"):
         image = image.convert("RGB")
 
     bio = BytesIO()
-    image.save(bio, format="JPEG", quality=90)
+    # qualidade 85 reduz tamanho sem perder legibilidade
+    image.save(bio, format="JPEG", quality=85, optimize=True)
     data = bio.getvalue()
 
     if not isinstance(storage_path, str):
@@ -65,7 +95,6 @@ def upload_photo(image: Image.Image, storage_path: str) -> str:
 
     return storage_path
 
-
 def ensure_bucket():
     try:
         supabase.storage.from_(BUCKET).list("")
@@ -75,9 +104,8 @@ def ensure_bucket():
 
 ensure_bucket()
 
-
 # -------------------------
-# DATABASE FUNCTIONS
+# DB FUNÇÕES
 # -------------------------
 def cadastrar_usuario(name: str, role: str, phone: str, email: str | None):
     payload = {
@@ -86,42 +114,132 @@ def cadastrar_usuario(name: str, role: str, phone: str, email: str | None):
         "phone": phone.strip() if phone else None,
         "email": (email or "").strip().lower() or None,
     }
-
     if payload["email"]:
         res = supabase.table("users").upsert(payload, on_conflict="email").execute()
     else:
         res = supabase.table("users").insert(payload).execute()
-
     return (res.data or [None])[0]
-
 
 def listar_usuarios():
     res = supabase.table("users").select("*").order("name").execute()
     return res.data or []
 
-
 def registrar_checkin(user_id: str, photo_path: str):
     supabase.table("checkins").insert({"user_id": user_id, "photo_path": photo_path}).execute()
 
-
-def buscar_checkins(limit=50, dt_from: date | None = None, dt_to: date | None = None, nome_like: str | None = None):
-    q = supabase.table("checkins").select("id, created_at, photo_path, users(name, role)").order("created_at", desc=True)
-
+def buscar_checkins(limit=2000, dt_from: date | None = None, dt_to: date | None = None, nome_like: str | None = None):
+    """Busca muitos e permite agrupar na UI."""
+    q = supabase.table("checkins").select("id, created_at, photo_path, user_id, users(name, role)").order("created_at", desc=True)
     if dt_from:
         q = q.gte("created_at", f"{dt_from} 00:00:00+00")
     if dt_to:
         q = q.lte("created_at", f"{dt_to} 23:59:59+00")
-
     q = q.limit(limit)
     res = q.execute()
     rows = res.data or []
-
     if nome_like:
         termo = nome_like.lower()
         rows = [r for r in rows if termo in ((r.get("users") or {}).get("name") or "").lower()]
-
     return rows
 
+# -------------------------
+# AGRUPAMENTO / “PASTAS”
+# -------------------------
+def agrupar_por_usuario_dia(rows):
+    """
+    Retorna:
+    {
+      user_id: {
+        'name': 'Maria',
+        'role': 'Produção',
+        'dias': {
+           '2025-11-07': [ {photo_path, created_at}, ... ],
+           ...
+        }
+      },
+      ...
+    }
+    """
+    grouped = defaultdict(lambda: {"name": "", "role": "", "dias": defaultdict(list)})
+    for r in rows:
+        u = r.get("users") or {}
+        uid = r.get("user_id")
+        nome = u.get("name") or "—"
+        role = u.get("role") or "—"
+        created = r["created_at"]
+        # normaliza dia
+        try:
+            dt_utc = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            dt_local = dt_utc.astimezone(TIMEZONE)
+        except Exception:
+            dt_local = agora()
+        dia = dt_local.strftime("%Y-%m-%d")
+
+        grouped[uid]["name"] = nome
+        grouped[uid]["role"] = role
+        grouped[uid]["dias"][dia].append(
+            {"photo_path": r["photo_path"], "created_at": dt_local}
+        )
+    return grouped
+
+# -------------------------
+# NORMALIZAÇÃO DE STORAGE
+# -------------------------
+def desired_path(user_id: str, created_at: datetime) -> str:
+    return f"{user_id}/{created_at.strftime('%Y-%m-%d')}/{created_at.strftime('%H%M%S%f')}.jpg"
+
+def normalize_storage_paths(rows):
+    """
+    Move (ou copia+remove) objetos antigos para a estrutura:
+    user_id/AAAA-MM-DD/HHMMSSfff.jpg
+    e atualiza 'photo_path' no banco.
+    """
+    moved = 0
+    for r in rows:
+        uid = r.get("user_id")
+        if not uid:
+            continue
+
+        # created_at -> timezone já convertido em buscar/agrupamento
+        created = r["created_at"]
+        try:
+            dt = datetime.fromisoformat(created.replace("Z", "+00:00")).astimezone(TIMEZONE)
+        except Exception:
+            dt = agora()
+
+        current_path = r["photo_path"]
+        new_path = desired_path(uid, dt)
+
+        if current_path == new_path:
+            continue
+
+        storage = supabase.storage.from_(BUCKET)
+
+        # tenta mover diretamente
+        try:
+            # nem toda SDK expõe move; se não existir, cairá no except
+            if hasattr(storage, "move"):
+                storage.move(current_path, new_path)  # type: ignore
+            else:
+                raise AttributeError("move not available")
+        except Exception:
+            # fallback: copy + remove
+            try:
+                storage.copy(current_path, new_path)
+                storage.remove(current_path)
+            except Exception:
+                # se não conseguir copiar/remover, segue para o próximo
+                continue
+
+        # atualiza no banco
+        try:
+            supabase.table("checkins").update({"photo_path": new_path}).eq("id", r["id"]).execute()
+            moved += 1
+        except Exception:
+            # se não atualizar, não quebra o loop
+            pass
+
+    return moved
 
 # =========================
 # ADMIN GATE (link + senha)
@@ -135,17 +253,14 @@ try:
 except Exception:
     admin_flag = False
 
-
 def is_admin():
     return admin_flag and st.session_state.admin_ok
-
 
 def admin_gate():
     if not admin_flag:
         return False
     if st.session_state.admin_ok:
         return True
-
     with st.sidebar:
         st.subheader("🔒 Admin login")
         pwd = st.text_input("Senha do Admin", type="password")
@@ -157,15 +272,12 @@ def admin_gate():
                 st.success("Acesso liberado.")
             else:
                 st.error("Senha inválida.")
-
     return st.session_state.admin_ok
-
 
 # =========================
 # UI — Abas Públicas
 # =========================
 tab_cadastro, tab_registro = st.tabs(["✍️ Cadastro", "✅ Registro"])
-
 
 # -------- CADASTRO --------
 with tab_cadastro:
@@ -176,7 +288,6 @@ with tab_cadastro:
         role = st.text_input("Função", placeholder="Ex.: Produção")
         phone = st.text_input("Telefone", placeholder="(xx) xxxxx-xxxx")
         email = st.text_input("Email (opcional)", placeholder="email@empresa.com")
-
         submitted = st.form_submit_button("Salvar cadastro")
 
     if submitted:
@@ -192,17 +303,14 @@ with tab_cadastro:
             except Exception as e:
                 st.error(f"Falha ao cadastrar: {e}")
 
-
 # -------- REGISTRO --------
 with tab_registro:
     st.subheader("Registro de presença com foto")
-
     usuarios = listar_usuarios()
 
     if not usuarios:
         st.info("Nenhum usuário cadastrado. Vá para a aba *Cadastro*.")
     else:
-
         # ------- BUSCA (acento-insensível) -------
         def norm(s: str) -> str:
             s = unicodedata.normalize("NFKD", s or "")
@@ -223,7 +331,6 @@ with tab_registro:
             def label(u):
                 role = u.get("role") or "Sem função"
                 return f"{u['name']} — {role}"
-
             labels = [label(u) for u in filtrados]
             escolha = st.radio("Selecione seu nome:", labels, key="escolha_user")
             user = filtrados[labels.index(escolha)]
@@ -238,6 +345,7 @@ with tab_registro:
 
             if st.button("✅ Confirmar e enviar"):
                 ts = agora()
+                # SALVA JÁ NA ESTRUTURA "PASTAS": user_id/AAAA-MM-DD/HHMMSSfff.jpg
                 storage_path = f"{user['id']}/{ts.strftime('%Y-%m-%d')}/{ts.strftime('%H%M%S%f')}.jpg"
                 try:
                     upload_photo(img, storage_path)
@@ -246,9 +354,8 @@ with tab_registro:
                 except Exception as e:
                     st.error(f"❌ Falha ao registrar: {e}")
 
-
 # =========================
-# UI — ADMIN (oculto por URL + senha)
+# UI — ADMIN (oculto + “pastas”)
 # =========================
 if admin_gate() and is_admin():
     st.markdown("---")
@@ -262,60 +369,69 @@ if admin_gate() and is_admin():
     with coln:
         nome_like = st.text_input("Buscar por nome", placeholder="ex.: Maria")
 
-    limit = st.slider("Quantidade a exibir", min_value=10, max_value=200, value=50, step=10)
+    st.caption("Dica: este modo exibe registros agrupados por **Usuário → Dia** com miniaturas.")
+    limit = st.slider("Quantidade máxima a carregar", min_value=200, max_value=5000, value=2000, step=100)
 
     try:
         rows = buscar_checkins(limit=limit, dt_from=dt_from, dt_to=dt_to, nome_like=nome_like or None)
 
+        # BOTÃO: NORMALIZAR ARQUIVOS ANTIGOS PARA A ESTRUTURA DE PASTAS
+        with st.expander("🧹 Organizar storage (mover fotos antigas para /user_id/AAAA-MM-DD/HHMMSS.jpg)"):
+            st.write("Use quando houver registros antigos fora da estrutura. Atualiza paths no banco.")
+            if st.button("Executar organização agora"):
+                moved = normalize_storage_paths(rows)
+                st.success(f"Organização concluída. Arquivos movidos/atualizados: {moved}. Recarregue para ver.")
+
         if not rows:
             st.info("Sem registros para os filtros atuais.")
         else:
-            for r in rows:
-                user_data = r.get("users") or {}
-                user_name = user_data.get("name") or "—"
-                user_role = user_data.get("role") or "—"
+            grouped = agrupar_por_usuario_dia(rows)
 
-                try:
-                    dt_utc = datetime.fromisoformat(r["created_at"].replace("Z", "+00:00"))
-                    dt_local = dt_utc.astimezone(TIMEZONE)
-                except Exception:
-                    dt_local = agora()
+            # LISTA DE USUÁRIOS (pastas)
+            for uid, meta in grouped.items():
+                with st.expander(f"👤 {meta['name']} — {meta['role']}", expanded=False):
+                    # por dia
+                    # ordena dias do mais recente para o mais antigo
+                    for dia in sorted(meta["dias"].keys(), reverse=True):
+                        reg_dia = meta["dias"][dia]
+                        # título bonito do dia
+                        try:
+                            data_br = datetime.strptime(dia, "%Y-%m-%d").strftime("%d/%m/%Y")
+                        except Exception:
+                            data_br = dia
+                        st.markdown(f"<div class='vlk-card'><div class='vlk-title'>📅 {data_br}</div></div>", unsafe_allow_html=True)
 
-                data_fmt = dt_local.strftime("%d/%m/%Y")
-                hora_fmt = dt_local.strftime("%H:%M")
+                        # grade de miniaturas (3 colunas)
+                        cols = st.columns(3)
+                        cidx = 0
+                        for item in reg_dia:
+                            created = item["created_at"]
+                            hora = created.strftime("%H:%M")
+                            # torna público (ou use URL assinada no futuro)
+                            public_resp = supabase.storage.from_(BUCKET).get_public_url(item["photo_path"])
+                            public_url = (
+                                public_resp
+                                if isinstance(public_resp, str)
+                                else public_resp.public_url
+                                if hasattr(public_resp, "public_url")
+                                else public_resp.get("publicUrl")
+                                if isinstance(public_resp, dict)
+                                else None
+                            )
+                            with cols[cidx]:
+                                if public_url:
+                                    st.image(public_url, caption=hora, use_container_width=True)
+                                else:
+                                    st.write(item["photo_path"])
+                            cidx = (cidx + 1) % 3
 
-                st.markdown(
-                    f"""
-                    <div style="padding:12px; border-radius:10px; border:1px solid #e2e2e2; margin-bottom:10px; background:#fafafa;">
-                        <div style="font-weight:600; font-size:16px;">{user_name}</div>
-                        <div style="color:#555; margin-top:2px;"><em>{user_role}</em></div>
-                        <div style="margin-top:6px;">📅 {data_fmt} &nbsp;&nbsp; ⏰ {hora_fmt}</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-
-                public_resp = supabase.storage.from_(BUCKET).get_public_url(r["photo_path"])
-                public_url = (
-                    public_resp
-                    if isinstance(public_resp, str)
-                    else public_resp.public_url
-                    if hasattr(public_resp, "public_url")
-                    else public_resp.get("publicUrl")
-                    if isinstance(public_resp, dict)
-                    else None
-                )
-
-                if public_url:
-                    show_image(public_url)
-                else:
-                    st.write(f"Foto: {r['photo_path']}")
-
+        # EXPORTAÇÃO CSV
         import pandas as pd
         df = pd.DataFrame(
             [
                 {
                     "created_at": r["created_at"],
+                    "user_id": r.get("user_id"),
                     "name": (r.get("users") or {}).get("name"),
                     "role": (r.get("users") or {}).get("role"),
                     "photo_path": r["photo_path"],
@@ -323,7 +439,6 @@ if admin_gate() and is_admin():
                 for r in rows
             ]
         )
-
         st.download_button(
             "⬇️ Baixar CSV",
             data=df.to_csv(index=False).encode("utf-8"),
@@ -333,3 +448,12 @@ if admin_gate() and is_admin():
 
     except Exception as e:
         st.error(f"Erro ao carregar Admin: {e}")
+
+# =========================
+# IDEIAS DE MELHORIA (TODO)
+# =========================
+# 1) Compressão extra: redimensionar a imagem para máx. 1024px no maior lado antes do upload (menos storage).
+# 2) Evitar duplicidade diária: antes de gravar, consultar se já existe check-in do user no dia e bloquear/alertar.
+# 3) Assinatura de URL (privacidade): usar create_signed_url(path, expires_in=60) no Admin em vez de bucket público.
+# 4) Paginação/lazy load no Admin para períodos muito grandes.
+# 5) QR Code/UID por usuário para pular a busca de nome no registro (ideal para filas grandes).
